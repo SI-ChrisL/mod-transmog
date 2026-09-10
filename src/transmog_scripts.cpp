@@ -82,10 +82,17 @@ std::vector<Item*> GetValidTransmogs (Player* player, Item* target, bool hasSear
     if (sT->GetUseCollectionSystem())
     {
         uint32 accountId = player->GetSession()->GetAccountId();
-        if (sT->collectionCache.find(accountId) == sT->collectionCache.end())
-            return allowedItems;
 
-        for (uint32 itemId : sT->collectionCache[accountId])
+        std::unordered_set<uint32> collected;
+        {
+            std::shared_lock<std::shared_mutex> lock(sT->transmogMutex);
+            auto itr = sT->collectionCache.find(accountId);
+            if (itr == sT->collectionCache.end())
+                return allowedItems;
+            collected = itr->second;
+        }
+
+        for (uint32 itemId : collected)
         {
             if (!sObjectMgr->GetItemTemplate(itemId))
                 continue;
@@ -125,7 +132,8 @@ std::vector<Item*> GetValidTransmogs (Player* player, Item* target, bool hasSear
 
 void PerformTransmogrification (Player* player, uint32 itemEntry, uint32 cost)
 {
-    uint8 slot = sT->selectionCache[player->GetGUID()];
+    auto slotItr = sT->selectionCache.find(player->GetGUID());
+    uint8 slot = slotItr != sT->selectionCache.end() ? slotItr->second : 0;
     WorldSession* session = player->GetSession();
     if (!player->HasEnoughMoney(cost))
     {
@@ -153,7 +161,8 @@ void PerformTransmogrification (Player* player, uint32 itemEntry, uint32 cost)
 
 void RemoveTransmogrification (Player* player)
 {
-    uint8 slot = sT->selectionCache[player->GetGUID()];
+    auto slotItr = sT->selectionCache.find(player->GetGUID());
+    uint8 slot = slotItr != sT->selectionCache.end() ? slotItr->second : 0;
     WorldSession* session = player->GetSession();
     if (Item* newItem = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
     {
@@ -893,20 +902,32 @@ public:
             CheckRetroActiveQuestAppearances(player);
 
         ObjectGuid playerGUID = player->GetGUID();
-        sT->entryMap.erase(playerGUID);
+        {
+            std::unique_lock<std::shared_mutex> lock(sT->transmogMutex);
+            sT->entryMap.erase(playerGUID);
+        }
         QueryResult result = CharacterDatabase.Query("SELECT GUID, FakeEntry FROM custom_transmogrification WHERE Owner = {}", player->GetGUID().GetCounter());
         if (result)
         {
+            // Collect first, then apply in one locked block so the lock is not
+            // held across row iteration or ItemTemplate lookups.
+            std::vector<std::pair<ObjectGuid, uint32>> loaded;
             do
             {
                 ObjectGuid itemGUID = ObjectGuid::Create<HighGuid::Item>((*result)[0].Get<uint32>());
                 uint32 fakeEntry = (*result)[1].Get<uint32>();
                 if (fakeEntry == HIDDEN_ITEM_ID || sObjectMgr->GetItemTemplate(fakeEntry))
+                    loaded.emplace_back(itemGUID, fakeEntry);
+            } while (result->NextRow());
+
+            {
+                std::unique_lock<std::shared_mutex> lock(sT->transmogMutex);
+                for (auto const& [itemGUID, fakeEntry] : loaded)
                 {
                     sT->dataMap[itemGUID] = playerGUID;
                     sT->entryMap[playerGUID][itemGUID] = fakeEntry;
                 }
-            } while (result->NextRow());
+            }
 
             for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
             {
@@ -924,10 +945,19 @@ public:
     void OnPlayerLogout(Player* player) override
     {
         ObjectGuid pGUID = player->GetGUID();
-        for (Transmogrification::transmog2Data::const_iterator it = sT->entryMap[pGUID].begin(); it != sT->entryMap[pGUID].end(); ++it)
-            sT->dataMap.erase(it->first);
-        sT->entryMap.erase(pGUID);
-        sT->selectionCache.erase(pGUID);
+        {
+            std::unique_lock<std::shared_mutex> lock(sT->transmogMutex);
+            // find() rather than operator[], which would default-insert an entry
+            // for a player that never had a transmog.
+            auto itr = sT->entryMap.find(pGUID);
+            if (itr != sT->entryMap.end())
+            {
+                for (auto it = itr->second.begin(); it != itr->second.end(); ++it)
+                    sT->dataMap.erase(it->first);
+                sT->entryMap.erase(itr);
+            }
+            sT->selectionCache.erase(pGUID);
+        }
 
 #ifdef PRESETS
         if (sT->GetEnableSets())
@@ -944,7 +974,8 @@ public:
         if (!sT->IsTransmogVendor(vendor->GetEntry()))
             return;
 
-        uint8 slot = sT->selectionCache[player->GetGUID()];
+        auto slotItr = sT->selectionCache.find(player->GetGUID());
+        uint8 slot = slotItr != sT->selectionCache.end() ? slotItr->second : 0;
 
         if (itemEntry == CUSTOM_HIDE_ITEM_VENDOR_ID || itemEntry == FALLBACK_HIDE_ITEM_VENDOR_ID)
         {

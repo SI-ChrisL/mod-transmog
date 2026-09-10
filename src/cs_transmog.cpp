@@ -65,7 +65,15 @@ public:
         uint32 accountId = player->GetSession()->GetAccountId();
         handler->PSendModuleSysMessage("mod-transmog", LANG_TRANSMOG_CMD_BEGIN_SYNC);
 
-        for (uint32 itemId : sTransmogrification->collectionCache[accountId])
+        std::unordered_set<uint32> collected;
+        {
+            std::shared_lock<std::shared_mutex> lock(sTransmogrification->transmogMutex);
+            auto itr = sTransmogrification->collectionCache.find(accountId);
+            if (itr != sTransmogrification->collectionCache.end())
+                collected = itr->second;
+        }
+
+        for (uint32 itemId : collected)
             handler->PSendSysMessage("TRANSMOG_SYNC:{}", itemId);
 
         handler->PSendModuleSysMessage("mod-transmog", LANG_TRANSMOG_CMD_COMPLETE_SYNC);
@@ -582,8 +590,13 @@ public:
         else
         {
             uint32 accountId = sCharacterCache->GetCharacterAccountIdByGuid(playerGuid);
-            auto const& collCache = sTransmogrification->collectionCache[accountId];
-            bool inCollection = collCache.find(srcItem->ItemId) != collCache.end();
+            bool inCollection = false;
+            {
+                std::shared_lock<std::shared_mutex> lock(sTransmogrification->transmogMutex);
+                auto itr = sTransmogrification->collectionCache.find(accountId);
+                inCollection = itr != sTransmogrification->collectionCache.end()
+                    && itr->second.find(srcItem->ItemId) != itr->second.end();
+            }
             collOk = inCollection;
             collLine += inCollection
                 ? "[+] " + okMsg

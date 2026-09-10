@@ -43,16 +43,22 @@ void Transmogrification::LoadPlayerSets(ObjectGuid pGUID)
 {
     LOG_DEBUG("module", "Transmogrification::LoadPlayerSets");
 
-    for (presetData::iterator it = presetById[pGUID].begin(); it != presetById[pGUID].end(); ++it)
-        it->second.clear();
+    {
+        std::lock_guard<std::mutex> lock(presetMutex);
+        presetById.erase(pGUID);
+        presetByName.erase(pGUID);
+    }
 
-    presetById[pGUID].clear();
-
-    presetByName[pGUID].clear();
-
+    // Query outside the lock -- never hold presetMutex across a DB call.
     QueryResult result = CharacterDatabase.Query("SELECT `PresetID`, `SetName`, `SetData` FROM `custom_transmogrification_sets` WHERE Owner = {}", pGUID.GetCounter());
     if (result)
     {
+        // Rows found to be empty are deleted after the locked section so that no
+        // database call happens while presetMutex is held.
+        std::vector<uint8> emptyPresets;
+
+        { // presetMutex scope; the DB deletes below run after it closes
+        std::lock_guard<std::mutex> lock(presetMutex);
         do
         {
             uint8 PresetID = (*result)[0].Get<uint8>();
@@ -84,9 +90,13 @@ void Transmogrification::LoadPlayerSets(ObjectGuid pGUID)
             else // should be deleted on startup, so  this never runs (shouldnt..)
             {
                 presetById[pGUID].erase(PresetID);
-                CharacterDatabase.Execute("DELETE FROM `custom_transmogrification_sets` WHERE Owner = {} AND PresetID = {}", pGUID.GetCounter(), PresetID);
+                emptyPresets.push_back(PresetID);
             }
         } while (result->NextRow());
+        } // end presetMutex scope
+
+        for (uint8 presetId : emptyPresets)
+            CharacterDatabase.Execute("DELETE FROM `custom_transmogrification_sets` WHERE Owner = {} AND PresetID = {}", pGUID.GetCounter(), presetId);
     }
 }
 
@@ -109,11 +119,13 @@ int32 Transmogrification::GetSetCopperCost() const
 
 void Transmogrification::UnloadPlayerSets(ObjectGuid pGUID)
 {
-    for (presetData::iterator it = presetById[pGUID].begin(); it != presetById[pGUID].end(); ++it)
-        it->second.clear();
-    presetById[pGUID].clear();
-
-    presetByName[pGUID].clear();
+    // Reachable from map threads via bot logout -- see presetMutex in the header.
+    std::lock_guard<std::mutex> lock(presetMutex);
+    // erase() rather than operator[]+clear(): the latter default-inserts an entry
+    // for every player who never had a preset and never removes it, so both maps
+    // grew one entry per distinct GUID for the lifetime of the process.
+    presetById.erase(pGUID);
+    presetByName.erase(pGUID);
 }
 #endif
 
@@ -425,6 +437,8 @@ uint32 Transmogrification::GetFakeEntry(ObjectGuid itemGUID) const
 {
     LOG_DEBUG("module", "Transmogrification::GetFakeEntry");
 
+    std::shared_lock<std::shared_mutex> lock(transmogMutex);
+
     transmogData::const_iterator itr = dataMap.find(itemGUID);
     if (itr == dataMap.end()) return 0;
     transmogMap::const_iterator itr2 = entryMap.find(itr->second);
@@ -457,14 +471,22 @@ void Transmogrification::DeleteFakeEntry(Player* player, uint8 /*slot*/, Item* i
 void Transmogrification::SetFakeEntry(Player* player, uint32 newEntry, uint8 /*slot*/, Item* itemTransmogrified)
 {
     ObjectGuid itemGUID = itemTransmogrified->GetGUID();
-    entryMap[player->GetGUID()][itemGUID] = newEntry;
-    dataMap[itemGUID] = player->GetGUID();
+    // Do NOT widen this block over UpdateItem: it calls Player::SetVisibleItemSlot,
+    // which fires OnPlayerAfterSetVisibleItemSlot -> GetFakeEntry, re-entering
+    // transmogMutex. std::shared_mutex is not recursive.
+    {
+        std::unique_lock<std::shared_mutex> lock(transmogMutex);
+        entryMap[player->GetGUID()][itemGUID] = newEntry;
+        dataMap[itemGUID] = player->GetGUID();
+    }
     CharacterDatabase.Execute("REPLACE INTO custom_transmogrification (GUID, FakeEntry, Owner) VALUES ({}, {}, {})", itemGUID.GetCounter(), newEntry, player->GetGUID().GetCounter());
     UpdateItem(player, itemTransmogrified);
 }
 
 bool Transmogrification::AddCollectedAppearance(uint32 accountId, uint32 itemId)
 {
+    std::unique_lock<std::shared_mutex> lock(transmogMutex);
+
     if (!collectionCache.contains(accountId))
     {
         collectionCache.insert({ accountId, {itemId} });
@@ -1204,11 +1226,15 @@ void Transmogrification::DeleteFakeFromDB(ObjectGuid::LowType itemLowGuid, Chara
 {
     ObjectGuid itemGUID = ObjectGuid::Create<HighGuid::Item>(itemLowGuid);
 
-    if (dataMap.find(itemGUID) != dataMap.end())
+    // Do NOT widen this block over the caller's UpdateItem -- see SetFakeEntry.
     {
-        if (entryMap.find(dataMap[itemGUID]) != entryMap.end())
-            entryMap[dataMap[itemGUID]].erase(itemGUID);
-        dataMap.erase(itemGUID);
+        std::unique_lock<std::shared_mutex> lock(transmogMutex);
+        if (dataMap.find(itemGUID) != dataMap.end())
+        {
+            if (entryMap.find(dataMap[itemGUID]) != entryMap.end())
+                entryMap[dataMap[itemGUID]].erase(itemGUID);
+            dataMap.erase(itemGUID);
+        }
     }
     if (trans)
         (*trans)->Append("DELETE FROM custom_transmogrification WHERE GUID = {}", itemLowGuid);

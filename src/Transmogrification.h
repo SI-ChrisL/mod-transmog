@@ -12,6 +12,9 @@
 #include "ItemTemplate.h"
 #include "QuestDef.h"
 #include "ItemTemplate.h"
+#include <mutex>
+#include <shared_mutex>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -191,6 +194,45 @@ public:
     transmogData dataMap; // dataMap[iGUID] = pGUID
     collectionCacheMap collectionCache;
     selectedSlotMap selectionCache;
+
+    // Guards entryMap, dataMap and collectionCache.
+    //
+    // selectionCache is NOT covered: it is written only from gossip/vendor
+    // handlers (world thread). It is erased inside the OnPlayerLogout critical
+    // section below purely because it shares that block; that erase is safe
+    // because the world thread is blocked in MapUpdater::wait() for the whole
+    // duration of every map update, so world-thread and map-thread code never
+    // overlap. If selectionCache ever gains a map-thread writer, guard it here.
+    //
+    // With MapUpdate.Threads > 1 these containers are mutated concurrently from
+    // several map threads: Map::Update -> Player::Update -> OnPlayerAfterUpdate
+    // reaches OnPlayerLootItem / OnPlayerEquip / OnPlayerCreateItem, which call
+    // AddCollectedAppearance. Two players looting on different maps in the same
+    // tick would otherwise rehash the same unordered_map concurrently.
+    //
+    // shared_mutex rather than mutex because GetFakeEntry is a read on a hot
+    // display path (OnMirrorImageDisplayItem, OnPlayerAfterSetVisibleItemSlot)
+    // and must not serialise the map threads against each other.
+    mutable std::shared_mutex transmogMutex;
+
+    // Guards presetById and presetByName.
+    //
+    // Separate from transmogMutex so the cold preset paths never contend with
+    // GetFakeEntry. Nothing holds both at once today. If that ever changes the
+    // order is presetMutex -> transmogMutex, never the reverse: the gossip preset
+    // loop (transmog_scripts.cpp:318-323) iterates presetById while calling
+    // PresetTransmog, which takes transmogMutex via SetFakeEntry.
+    //
+    // UnloadPlayerSets is reachable from map threads: PlayerbotAI::UpdateAIInternal
+    // (PlayerbotAI.cpp:534) calls LogoutPlayerBot inline, which calls
+    // WorldSession::LogoutPlayer directly (PlayerbotMgr.cpp:402), firing
+    // OnPlayerLogout on the map thread. Only the group cleanup is queued to the
+    // world thread. Two bots logging out on two maps in one tick would otherwise
+    // rehash these maps concurrently.
+    //
+    // The gossip-side preset sites (transmog_scripts.cpp) are world-thread only
+    // and rely on the same non-overlap invariant described above.
+    std::mutex presetMutex;
 
 #ifdef PRESETS
     bool EnableSetInfo;
