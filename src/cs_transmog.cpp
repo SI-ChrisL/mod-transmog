@@ -341,9 +341,14 @@ public:
             return ClaimResult::Unsuitable;
 
         uint32 accountId = player->GetSession()->GetAccountId();
-        auto accIt = sTransmogrification->collectionCache.find(accountId);
-        if (accIt != sTransmogrification->collectionCache.end() && accIt->second.contains(itemTemplate->ItemId))
-            return ClaimResult::AlreadyOwned;
+        // Scoped so the lock is released before AddToDatabase below: that path takes
+        // transmogMutex exclusively via AddCollectedAppearance and the mutex is not recursive.
+        {
+            std::shared_lock<std::shared_mutex> lock(sTransmogrification->transmogMutex);
+            auto accIt = sTransmogrification->collectionCache.find(accountId);
+            if (accIt != sTransmogrification->collectionCache.end() && accIt->second.contains(itemTemplate->ItemId))
+                return ClaimResult::AlreadyOwned;
+        }
 
         // Claim the physical item: bind it to the player and drop the refundable/BoP-tradeable flags
         // so the appearance can't be collected and then refunded to a vendor or traded away.
